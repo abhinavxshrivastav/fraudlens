@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.csv text eol=lf
+
+# Model artefacts are large binaries -- tracked via Git LFS
+artifacts/**/*.joblib filter=lfs diff=lfs merge=lfs -text
+artifacts/**/*.pkl    filter=lfs diff=lfs merge=lfs -text

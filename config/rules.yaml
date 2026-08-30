@@ -1,0 +1,155 @@
+# ---------------------------------------------------------------------------
+# FraudLens rule set
+#
+# Rules are DATA, not code. Conditions are evaluated by a small declarative
+# interpreter (fraudlens.rules.engine) -- never by `eval`. A fraud analyst can
+# change a threshold here without writing Python, and every rule carries a
+# version so a historical decision can be reproduced exactly.
+#
+# Bump `version` on any change, and bump a rule's own `version` when its
+# condition changes. The decision log records `R-XXX-NNN@vN` per firing.
+#
+# Actions:
+#   block   - decisive stop; short-circuits scoring
+#   review  - advisory; raises the band, model score still contributes
+#   flag    - advisory; recorded for analysis, does not raise the band
+#   allow   - explicit suppression; wins over advisory hits
+#
+# Grammar:
+#   leaf:      {feature: <name>, op: gt|gte|lt|lte|eq|ne|between|in, value: <v>}
+#   composite: {all: [...]} | {any: [...]} | {not: {...}}
+# ---------------------------------------------------------------------------
+
+version: "2026.08.1"
+
+rules:
+  # -- Impossible travel ----------------------------------------------------
+  - id: R-GEO-001
+    name: Impossible travel between consecutive transactions
+    description: >
+      The card was used in two locations faster than any journey could connect
+      them. One of the two is not the genuine cardholder. The threshold sits
+      above commercial cruise speed so ordinary air travel does not trigger it.
+    version: 1
+    action: block
+    severity: critical
+    reason_code: R12
+    when:
+      all:
+        - {feature: is_impossible_travel, op: eq, value: 1}
+        - {feature: dist_prev_txn_km, op: gt, value: 100}
+
+  # -- Card testing ---------------------------------------------------------
+  - id: R-VEL-001
+    name: Card testing burst
+    description: >
+      Many low-value transactions across distinct merchants in a short window is
+      the signature of an attacker validating a stolen card number before
+      attempting a large purchase. Distinct *merchants* is the discriminating
+      signal -- a genuine customer making several purchases usually does so at
+      one merchant.
+    version: 1
+    action: review
+    severity: high
+    reason_code: R07
+    when:
+      all:
+        - {feature: txn_count_1h, op: gte, value: 5}
+        - {feature: distinct_merchants_24h, op: gte, value: 4}
+        - {feature: amt, op: lt, value: 50}
+
+  - id: R-VEL-002
+    name: Extreme short-window velocity
+    description: >
+      Transaction rate far beyond plausible human behaviour, regardless of
+      amount or merchant spread.
+    version: 1
+    action: review
+    severity: high
+    reason_code: R08
+    when: {feature: txn_count_1h, op: gte, value: 12}
+
+  # -- Amount anomaly -------------------------------------------------------
+  - id: R-AMT-001
+    name: Amount far outside the card's established pattern
+    description: >
+      The transaction is a large multiple of the card's 30-day average and large
+      in absolute terms. Both conditions are required: a 20x multiple on a card
+      that normally spends 2 is not interesting.
+    version: 1
+    action: review
+    severity: medium
+    reason_code: R01
+    when:
+      all:
+        - {feature: amt_ratio_mean_30d, op: gte, value: 10}
+        - {feature: amt, op: gte, value: 500}
+        - {feature: card_history_count, op: gte, value: 5}
+
+  - id: R-AMT-002
+    name: High-value transaction at an unfamiliar merchant at night
+    description: >
+      Three weak signals that are individually unremarkable and jointly a
+      well-established fraud pattern.
+    version: 1
+    action: review
+    severity: medium
+    reason_code: R04
+    when:
+      all:
+        - {feature: amt, op: gte, value: 300}
+        - {feature: is_new_merchant, op: eq, value: 1}
+        - {feature: is_night, op: eq, value: 1}
+
+  # -- Geographic -----------------------------------------------------------
+  - id: R-GEO-002
+    name: Transaction far from home at an unfamiliar merchant
+    description: >
+      Distance from the cardholder's registered address, combined with a
+      merchant the card has never used. Advisory only: legitimate travel
+      produces exactly this pattern, so it informs the band rather than
+      determining it.
+    version: 1
+    action: flag
+    severity: low
+    reason_code: R11
+    when:
+      all:
+        - {feature: dist_home_merch_km, op: gte, value: 500}
+        - {feature: is_new_merchant, op: eq, value: 1}
+
+  # -- Night-time activity --------------------------------------------------
+  - id: R-TMP-001
+    name: Sustained overnight activity
+    description: >
+      Multiple transactions in the small hours on a card with an established
+      history. Fraud in this dataset concentrates heavily overnight, when the
+      genuine cardholder is asleep and unlikely to notice.
+    version: 1
+    action: flag
+    severity: low
+    reason_code: R09
+    when:
+      all:
+        - {feature: is_night, op: eq, value: 1}
+        - {feature: txn_count_24h, op: gte, value: 3}
+        - {feature: card_history_count, op: gte, value: 10}
+
+  # -- Suppression ----------------------------------------------------------
+  - id: R-ALW-001
+    name: Low-value transaction at an established merchant
+    description: >
+      Small amount, merchant the card uses regularly, no velocity anomaly.
+      Suppresses advisory alerts on the highest-volume, lowest-risk slice of
+      traffic. This rule exists to protect analyst capacity, which is the
+      scarcest resource in the system.
+    version: 1
+    action: allow
+    severity: low
+    reason_code: A01
+    when:
+      all:
+        - {feature: amt, op: lt, value: 25}
+        - {feature: is_new_merchant, op: eq, value: 0}
+        - {feature: txn_count_1h, op: lte, value: 2}
+        - {feature: is_impossible_travel, op: eq, value: 0}
