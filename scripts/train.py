@@ -419,15 +419,29 @@ def _train_xgboost(x_train, y_train, x_valid, y_valid, x_test, y_test, amt_valid
         n_jobs=-1,
     )
     clf.fit(x_train, y_train, eval_set=[(x_valid, y_valid)], verbose=False)
-    valid = clf.predict_proba(x_valid)[:, 1]
+
+    # Calibrate the challenger the same way the champion is calibrated.
+    #
+    # Comparing an uncalibrated model against a calibrated one on *expected cost*
+    # is not a fair test: the cost model requires genuine probabilities, and a
+    # raw gradient-boosting margin is not one. An earlier version skipped this
+    # and the challenger appeared to win on cost purely because its untethered
+    # score scale interacted differently with the threshold grid.
+    from sklearn.isotonic import IsotonicRegression
+
+    raw_valid = clf.predict_proba(x_valid)[:, 1]
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    calibrator.fit(raw_valid, y_valid)
+
+    valid = calibrator.predict(raw_valid)
     thr = min_cost_threshold(y_valid, valid, amounts=amt_valid, cost_model=costs).threshold
     return evaluate(
         "XGBoost (challenger)",
         y_test,
-        clf.predict_proba(x_test)[:, 1],
+        calibrator.predict(clf.predict_proba(x_test)[:, 1]),
         amt_test,
         thr,
-        calibrated=False,
+        calibrated=True,
     )
 
 

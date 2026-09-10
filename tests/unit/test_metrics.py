@@ -21,6 +21,7 @@ from fraudlens.evaluation.metrics import (
     precision_at_k,
     recall_at_fpr,
     roc_auc,
+    threshold_grid,
 )
 
 
@@ -231,6 +232,84 @@ class TestCostCurveAndThresholdSelection:
         )
         assert pricey.threshold > cheap.threshold
         assert pricey.n_alerts < cheap.n_alerts
+
+
+def _isotonic_like() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Scores shaped like isotonic-calibrated output.
+
+    A handful of distinct steps, 99.9% of the mass on the lowest two, and every
+    usable operating point in a thin tail -- the shape of the real test fold,
+    where 159,301 scores take only 60 distinct values.
+    """
+    steps = [  # (score, legitimate, fraud)
+        (0.001, 89_990, 10),
+        (0.003, 9_875, 5),
+        (0.2, 32, 8),
+        (0.5, 20, 20),
+        (0.9, 2, 18),
+        (1.0, 0, 20),
+    ]
+    scores = np.concatenate([np.full(legit + fraud, s) for s, legit, fraud in steps])
+    truth = np.concatenate([np.r_[np.zeros(legit), np.ones(fraud)] for _, legit, fraud in steps])
+    return truth.astype(int), scores, np.full(scores.size, 200.0)
+
+
+class TestThresholdGrid:
+    """Regression cover for a grid that once reported a threshold at 3.4x the true minimum.
+
+    The grid used to be built from score quantiles. On a step function, almost
+    every quantile lands on the same few low steps, so the grid jumped straight
+    past the tail where the optimum lives.
+    """
+
+    def test_grid_is_every_distinct_score_when_there_are_few(self) -> None:
+        _, scores, _ = _isotonic_like()
+        np.testing.assert_array_equal(threshold_grid(scores), [0.001, 0.003, 0.2, 0.5, 0.9, 1.0])
+
+    def test_finds_the_optimum_in_the_sparse_tail(self) -> None:
+        y, s, amounts = _isotonic_like()
+        best = min_cost_threshold(y, s, amounts=amounts)
+        # By hand at t=0.2: 120 alerts x £4 + 54 false positives x £18
+        # + 15 missed frauds x £200 = £4,452, the cheapest step.
+        assert best.threshold == pytest.approx(0.2)
+        assert best.expected_cost == pytest.approx(4_452.0)
+
+    def test_selection_matches_brute_force_over_all_distinct_scores(self) -> None:
+        y, s, amounts = _isotonic_like()
+        brute = min(
+            evaluate_at_threshold(y, s, float(t), amounts=amounts).expected_cost
+            for t in np.unique(s)
+        )
+        assert min_cost_threshold(y, s, amounts=amounts).expected_cost == pytest.approx(brute)
+
+    def test_fixture_reproduces_the_original_failure(self) -> None:
+        # Guards the guard: the old 500-point quantile grid must miss the
+        # optimum on this data, or the tests above would pass against it too.
+        y, s, amounts = _isotonic_like()
+        quantile_grid = np.unique(np.quantile(s, np.linspace(0, 1, 500)))
+        quantile_best = min(
+            evaluate_at_threshold(y, s, float(t), amounts=amounts).expected_cost
+            for t in quantile_grid
+        )
+        assert 0.2 not in quantile_grid
+        assert quantile_best > 2 * min_cost_threshold(y, s, amounts=amounts).expected_cost
+
+    def test_thinned_grid_spans_the_full_range(self) -> None:
+        # With many distinct scores the grid is thinned evenly across the sorted
+        # distinct values, rather than packed into the dense low end.
+        scores = np.random.default_rng(0).permutation(np.linspace(0.0, 1.0, 10_001))
+        grid = threshold_grid(scores, max_points=50)
+        assert grid.size <= 50
+        assert grid[0] == 0.0
+        assert grid[-1] == 1.0
+        assert np.all(np.diff(grid) > 0)
+
+    def test_non_finite_scores_are_ignored(self) -> None:
+        grid = threshold_grid(np.array([0.3, np.nan, 0.1, np.inf, 0.3]))
+        np.testing.assert_array_equal(grid, [0.1, 0.3])
+
+    def test_no_finite_scores_yields_a_single_threshold(self) -> None:
+        np.testing.assert_array_equal(threshold_grid(np.array([np.nan])), [0.0])
 
 
 class TestAlertRate:

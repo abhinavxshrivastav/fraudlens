@@ -277,24 +277,50 @@ def evaluate_at_threshold(
     )
 
 
+def threshold_grid(scores: np.ndarray, max_points: int = 500) -> np.ndarray:
+    """The set of thresholds worth evaluating.
+
+    Built from the **distinct score values**, not from quantiles. Two thresholds
+    falling between the same pair of adjacent scores classify every row
+    identically, so the distinct values are the complete set of behaviourally
+    different operating points.
+
+    This matters more than it sounds. Isotonic calibration is a *step function*:
+    on the test fold, 159,301 scores take only **60 distinct values**. A
+    quantile grid over those is worse than useless, because 99.4% of the mass
+    sits in a handful of steps near zero -- the grid jumps from 0.0028 straight
+    to 1.0 and never visits the region where every usable operating point lives.
+    An earlier version did exactly that and reported an "optimal" threshold
+    costing 3.4x the true minimum.
+
+    For an uncalibrated model with many distinct scores, the grid is thinned to
+    an even spread **across the sorted distinct values**, which keeps coverage
+    of the full range rather than concentrating on the dense low end.
+    """
+    unique = np.unique(scores[np.isfinite(scores)])
+    if unique.size == 0:
+        return np.array([0.0])
+    if unique.size <= max_points:
+        return unique
+    indices = np.unique(np.linspace(0, unique.size - 1, max_points).astype(int))
+    return np.asarray(unique[indices], dtype=np.float64)
+
+
 def cost_curve(
     y_true: ArrayLike,
     y_score: ArrayLike,
     *,
     amounts: ArrayLike | None = None,
     cost_model: CostModel | None = None,
-    n_thresholds: int = 200,
+    n_thresholds: int = 500,
 ) -> list[ThresholdMetrics]:
-    """Evaluate across a grid of thresholds spanning the observed score range.
+    """Evaluate across every behaviourally distinct threshold.
 
-    Thresholds are placed at score quantiles rather than uniformly, so the grid
-    stays dense where the scores actually are. With a well-separated model most
-    of the probability mass sits near zero, and a uniform grid would waste
-    almost every point on an empty region.
+    See :func:`threshold_grid` for why the grid is built from distinct score
+    values rather than quantiles.
     """
     truth, score = _as_arrays(y_true, y_score)
-    quantiles = np.linspace(0.0, 1.0, n_thresholds)
-    grid = np.unique(np.quantile(score, quantiles))
+    grid = threshold_grid(score, max_points=n_thresholds)
     return [
         evaluate_at_threshold(truth, score, float(t), amounts=amounts, cost_model=cost_model)
         for t in grid
@@ -307,7 +333,7 @@ def min_cost_threshold(
     *,
     amounts: ArrayLike | None = None,
     cost_model: CostModel | None = None,
-    n_thresholds: int = 200,
+    n_thresholds: int = 500,
 ) -> ThresholdMetrics:
     """Return the operating point that minimises expected cost.
 
