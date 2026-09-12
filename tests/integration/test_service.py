@@ -7,13 +7,15 @@ CI without model files and exercise the wiring rather than the model's accuracy.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from fraudlens.api.app import app, get_service
 from fraudlens.api.schemas import TransactionRequest
-from fraudlens.api.service import FraudLensService, ModelNotLoadedError
+from fraudlens.api.service import FraudLensService, ModelNotLoadedError, _load_rules
+from fraudlens.config import Settings
 from fraudlens.features.store import InMemoryFeatureStore
 from fraudlens.rules.engine import RuleEngine
 from fraudlens.scoring.decision import PolicyThresholds, RiskBand
@@ -64,8 +66,6 @@ def make_request(
 
 
 def build_service(probability: float = 0.05, rules_yaml: bool = True) -> FraudLensService:
-    from pathlib import Path
-
     root = Path(__file__).resolve().parents[2]
     engine = RuleEngine.from_yaml(root / "config" / "rules.yaml") if rules_yaml else RuleEngine()
     return FraudLensService(
@@ -179,7 +179,7 @@ class TestHttpLayer:
 
     def test_score_endpoint(self, client: TestClient) -> None:
         payload = make_request(amount=1_800.0).model_dump(mode="json")
-        response = client.post("/score", json=payload)
+        response = client.post("/api/score", json=payload)
         assert response.status_code == 200
         body = response.json()
         assert body["band"] in {"approve", "challenge", "review", "block"}
@@ -188,53 +188,57 @@ class TestHttpLayer:
     def test_rejects_negative_amount(self, client: TestClient) -> None:
         payload = make_request().model_dump(mode="json")
         payload["amount"] = -5.0
-        assert client.post("/score", json=payload).status_code == 422
+        assert client.post("/api/score", json=payload).status_code == 422
 
     def test_rejects_out_of_range_latitude(self, client: TestClient) -> None:
         payload = make_request().model_dump(mode="json")
         payload["merchant_lat"] = 120.0
-        assert client.post("/score", json=payload).status_code == 422
+        assert client.post("/api/score", json=payload).status_code == 422
 
     def test_rejects_unknown_fields(self, client: TestClient) -> None:
         # extra="forbid": a typo'd field name should be a loud 422, not a
         # silently ignored value.
         payload = make_request().model_dump(mode="json")
         payload["ammount"] = 50.0
-        assert client.post("/score", json=payload).status_code == 422
+        assert client.post("/api/score", json=payload).status_code == 422
 
     def test_alert_queue_populates(self, client: TestClient) -> None:
-        client.post("/score", json=make_request(amount=2_000.0).model_dump(mode="json"))
-        response = client.get("/alerts")
+        client.post("/api/score", json=make_request(amount=2_000.0).model_dump(mode="json"))
+        response = client.get("/api/alerts")
         assert response.status_code == 200
         assert response.json()["total"] >= 1
 
     def test_disposition_round_trip(self, client: TestClient) -> None:
         request = make_request(amount=2_000.0, txn_id="disp-1")
-        client.post("/score", json=request.model_dump(mode="json"))
+        client.post("/api/score", json=request.model_dump(mode="json"))
         response = client.post(
-            "/alerts/disp-1/disposition",
+            "/api/alerts/disp-1/disposition",
             json={"disposition": "confirmed_fraud", "analyst": "abhinav"},
         )
         assert response.status_code == 200
         assert response.json()["disposition"] == "confirmed_fraud"
 
     def test_disposition_on_unknown_alert_is_404(self, client: TestClient) -> None:
-        response = client.post("/alerts/nope/disposition", json={"disposition": "false_positive"})
+        response = client.post(
+            "/api/alerts/nope/disposition", json={"disposition": "false_positive"}
+        )
         assert response.status_code == 404
 
     def test_invalid_disposition_is_rejected(self, client: TestClient) -> None:
         request = make_request(amount=2_000.0, txn_id="disp-2")
-        client.post("/score", json=request.model_dump(mode="json"))
-        response = client.post("/alerts/disp-2/disposition", json={"disposition": "probably_fine"})
+        client.post("/api/score", json=request.model_dump(mode="json"))
+        response = client.post(
+            "/api/alerts/disp-2/disposition", json={"disposition": "probably_fine"}
+        )
         assert response.status_code == 422
 
     def test_health_reports_ready(self, client: TestClient) -> None:
-        body = client.get("/health").json()
+        body = client.get("/api/health").json()
         assert body["status"] == "ok"
         assert body["model_loaded"] is True
 
     def test_rules_endpoint_lists_features_per_rule(self, client: TestClient) -> None:
-        body = client.get("/rules").json()
+        body = client.get("/api/rules").json()
         assert len(body["rules"]) >= 5
         assert all("features" in r for r in body["rules"])
 
@@ -245,12 +249,34 @@ class TestHttpLayer:
                 for i in range(3)
             ]
         }
-        response = client.post("/score/batch", json=payload)
+        response = client.post("/api/score/batch", json=payload)
         assert response.status_code == 200
         assert response.json()["count"] == 3
 
     def test_empty_batch_is_rejected(self, client: TestClient) -> None:
-        assert client.post("/score/batch", json={"transactions": []}).status_code == 422
+        assert client.post("/api/score/batch", json={"transactions": []}).status_code == 422
+
+
+class TestRuleLoading:
+    def test_service_loads_rules_from_the_working_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Mirrors the container: rules live under WORKDIR, not beside the
+        # installed package. A loader that derives the path from __file__ picks
+        # up the source tree's copy instead, and in a real non-editable install
+        # finds nothing and scores with an empty rule set.
+        source = Path(__file__).resolve().parents[2] / "config" / "rules.yaml"
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "rules.yaml").write_text(
+            source.read_text(encoding="utf-8").replace('"2026.08.1"', '"from-workdir"'),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        engine = _load_rules(Settings(_env_file=None))
+
+        assert engine.version == "from-workdir"
+        assert len(engine.rules) > 0
 
 
 def _event(service: FraudLensService, request: TransactionRequest):

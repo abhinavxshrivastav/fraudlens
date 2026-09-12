@@ -58,7 +58,10 @@ class TransactionRequest(BaseModel):
 
 class ReasonCodeResponse(BaseModel):
     code: str
+    #: Code and explanation together, for plain-text consumers.
     text: str
+    #: The explanation alone, for clients that render the code separately.
+    message: str
     category: str
     feature: str
     value: float

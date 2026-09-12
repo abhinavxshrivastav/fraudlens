@@ -54,8 +54,19 @@ class Settings(BaseSettings):
     log_json: bool = False
 
     # -- paths -------------------------------------------------------------
+    # Relative by default, resolved against the working directory. That is what
+    # makes the same configuration work for an editable install run from the
+    # repository root and for a container whose WORKDIR holds the same layout.
+    #
+    # Deriving these from `__file__` instead is the obvious approach and it is
+    # wrong: under a non-editable `pip install .` the package lives in
+    # site-packages, so a repo-relative walk lands somewhere with no config and
+    # no console. The failure is silent -- an empty rule set still scores -- so
+    # it is worth being explicit about.
     data_dir: Path = Path("data")
     artifact_dir: Path = Path("artifacts")
+    rules_path: Path = Path("config/rules.yaml")
+    console_dir: Path = Path("web/dist")
 
     # -- serving -----------------------------------------------------------
     api_host: str = "0.0.0.0"  # noqa: S104 - binding all interfaces is intended in a container
@@ -112,6 +123,32 @@ class Settings(BaseSettings):
     @property
     def report_dir(self) -> Path:
         return self.artifact_dir / "reports"
+
+    # -- path resolution ---------------------------------------------------
+
+    def resolve(self, path: Path) -> Path:
+        """Resolve a configured path, falling back to the source tree.
+
+        Order: the path as given (relative to the working directory), then the
+        repository root inferred from this module. The fallback exists so that
+        tests and ad-hoc scripts run from a subdirectory still find the rule set;
+        the primary path is what a container and a repo-root run both use.
+        """
+        if path.is_absolute():
+            return path
+        if path.exists():
+            return path
+        repo_root = Path(__file__).resolve().parents[3]
+        candidate = repo_root / path
+        return candidate if candidate.exists() else path
+
+    @property
+    def resolved_rules_path(self) -> Path:
+        return self.resolve(self.rules_path)
+
+    @property
+    def resolved_console_dir(self) -> Path:
+        return self.resolve(self.console_dir)
 
 
 @lru_cache(maxsize=1)

@@ -49,8 +49,13 @@ class ReasonCodeSpec:
     #: How the raw feature value is transformed for display.
     display: Callable[[float], float] = float
 
+    def message(self, value: float) -> str:
+        """The explanation on its own, with no code prefix."""
+        return self.template.format(value=self.display(value))
+
     def render(self, value: float) -> str:
-        return f"{self.code} - {self.template.format(value=self.display(value))}"
+        """Code and explanation together, for logs and plain-text output."""
+        return f"{self.code} - {self.message(value)}"
 
 
 def _gt(threshold: float) -> Callable[[float], bool]:
@@ -202,7 +207,11 @@ class ReasonCodeInstance:
     feature: str
     value: float
     contribution: float
+    #: Code and explanation, e.g. "R12 - Implied travel speed of ...".
     text: str
+    #: The explanation alone. The console renders the code as a separate chip,
+    #: so using `text` there would print the code twice.
+    message: str
     category: str
 
     def __str__(self) -> str:
@@ -254,6 +263,7 @@ def derive_reason_codes(
                     value=numeric,
                     contribution=contribution,
                     text=spec.render(numeric),
+                    message=spec.message(numeric),
                     category=spec.category,
                 ),
             )
